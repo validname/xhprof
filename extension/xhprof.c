@@ -480,6 +480,25 @@ PHP_MINIT_FUNCTION(xhprof) {
   /* To make it random number generator repeatable to ease testing. */
   srand(0);
 #endif
+
+  /* Get frequencies before xhprof_enable() will be called */
+  if (hp_globals.cpu_frequencies == NULL) {
+    get_all_cpu_frequencies();
+  }
+
+  /* Prealloc free entry list */
+  hp_entry_t *cur = NULL;
+  hp_entry_t *prev = NULL;
+
+  for (i = 0; i < 4096; i++) {
+    cur = (hp_entry_t *)malloc(sizeof(hp_entry_t));
+    if ( cur == NULL )
+      break;
+    cur->prev_hprof = prev;
+    prev = cur;
+  }
+  hp_globals.entry_free_list = prev;
+
   return SUCCESS;
 }
 
@@ -489,6 +508,7 @@ PHP_MINIT_FUNCTION(xhprof) {
 PHP_MSHUTDOWN_FUNCTION(xhprof) {
   /* Make sure cpu_frequencies is free'ed. */
   clear_frequencies();
+  restore_cpu_affinity(&hp_globals.prev_mask);
 
   /* free any remaining items in the free list */
   hp_free_the_free_list();
@@ -674,7 +694,6 @@ void hp_init_profiler_state(int level TSRMLS_DC) {
    * calculate them lazily. */
   if (hp_globals.cpu_frequencies == NULL) {
     get_all_cpu_frequencies();
-    restore_cpu_affinity(&hp_globals.prev_mask);
   }
 
   /* bind to a random cpu so that we can use rdtsc instruction. */
@@ -1053,6 +1072,7 @@ static hp_entry_t *hp_fast_alloc_hprof_entry() {
     hp_globals.entry_free_list = p->prev_hprof;
     return p;
   } else {
+    php_error_docref(NULL TSRMLS_CC, E_NOTICE, "(NGS patch) alloc for new entry");
     return (hp_entry_t *)malloc(sizeof(hp_entry_t));
   }
 }
@@ -1195,6 +1215,12 @@ void hp_sample_stack(hp_entry_t  **entries  TSRMLS_DC) {
 void hp_sample_check(hp_entry_t **entries  TSRMLS_DC) {
   /* Validate input */
   if (!entries || !(*entries)) {
+    return;
+  }
+
+  if ( hp_globals.sampling_interval_tsc == 0 ) {
+    /* prevent infinity loop when sampling interval is zero.
+     * That's happens when CPU frequencies is not discovered. */
     return;
   }
 
@@ -1342,31 +1368,58 @@ static double get_cpu_frequency() {
  */
 static void get_all_cpu_frequencies() {
   int id;
-  double frequency;
 
   hp_globals.cpu_frequencies = malloc(sizeof(double) * hp_globals.cpu_num);
   if (hp_globals.cpu_frequencies == NULL) {
     return;
   }
 
-  /* Iterate over all cpus found on the machine. */
-  for (id = 0; id < hp_globals.cpu_num; ++id) {
-    /* Only get the previous cpu affinity mask for the first call. */
-    if (bind_to_cpu(id)) {
-      clear_frequencies();
-      return;
-    }
+  char *p, buf[1024], pattern[]="cpu MHz";
+  int is_error = 0;
 
-    /* Make sure the current process gets scheduled to the target cpu. This
-     * might not be necessary though. */
-    usleep(0);
-
-    frequency = get_cpu_frequency();
-    if (frequency == 0.0) {
-      clear_frequencies();
-      return;
+  FILE *fp = fopen("/proc/cpuinfo", "r");
+  if ( fp == NULL ) {
+    /* Have to clear to avoid strange fields while counting custom error handlers */
+    clear_frequencies();
+    php_error_docref(NULL TSRMLS_CC, E_WARNING, "(NGS patch) cannot open /proc/cpuinfo, error string: '%s'", strerror(errno));
+    is_error = 1;
+  } else {
+    id = 0;
+    while (fgets(buf, sizeof(buf), fp) != NULL) {
+      if (strncmp(buf, pattern, strlen(pattern))==0) {
+        p = buf + strlen(pattern);
+        while ( *p == ' ' || *p == '\t' ) p++;
+        if (*p != ':') {
+          is_error = 1;
+          php_error_docref(NULL TSRMLS_CC, E_WARNING, "(NGS patch) wrong delimiter in /proc/cpuinfo: expected ':', but got '%s'", p);
+          break;
+        } else
+          p++;
+        while ( *p == ' ' || *p == '\t' ) p++;
+          if (*p<'0' || *p>'9') {
+            is_error = 1;
+            php_error_docref(NULL TSRMLS_CC, E_WARNING, "(NGS patch) wrong character in frequency string: expected number, but got '%s'", p);
+            break;
+        } else
+          hp_globals.cpu_frequencies[id] = strtod(p, NULL);
+        id++;
+        if ( id > hp_globals.cpu_num ) {
+          is_error = 1;
+          php_error_docref(NULL TSRMLS_CC, E_WARNING, "(NGS patch) /proc/cpuinfo has more CPU/cores, then reported from system (%d)", hp_globals.cpu_num);
+          break;
+        }
+      } else
+        continue;
     }
-    hp_globals.cpu_frequencies[id] = frequency;
+    fclose(fp);
+    if ( id < hp_globals.cpu_num ) {
+      is_error = 1;
+      php_error_docref(NULL TSRMLS_CC, E_WARNING, "(NGS patch) /proc/cpuinfo has less CPU/cores (%d), then reported from system (%d)", id, hp_globals.cpu_num);
+    }
+  }
+  if (is_error != 0) {
+    clear_frequencies();
+    php_error_docref(NULL TSRMLS_CC, E_WARNING, "(NGS patch) clearing all frequencies because of errors");
   }
 }
 
@@ -1399,7 +1452,6 @@ static void clear_frequencies() {
     free(hp_globals.cpu_frequencies);
     hp_globals.cpu_frequencies = NULL;
   }
-  restore_cpu_affinity(&hp_globals.prev_mask);
 }
 
 
@@ -1485,7 +1537,13 @@ void hp_mode_sampled_init_cb(TSRMLS_D) {
   struct timeval  now;
   uint64 truncated_us;
   uint64 truncated_tsc;
-  double cpu_freq = hp_globals.cpu_frequencies[hp_globals.cur_cpu_id];
+  double cpu_freq = 0.0;
+
+  if (hp_globals.cpu_frequencies) {
+    cpu_freq = hp_globals.cpu_frequencies[hp_globals.cur_cpu_id];
+    /* Make note that if CPU frequencies is not discovered,
+     * hp_globals.sampling_interval_tsc will be zero. */
+  }
 
   /* Init the last_sample in tsc */
   hp_globals.last_sample_tsc = cycle_timer();
@@ -1577,8 +1635,12 @@ zval * hp_mode_shared_endfn_cb(hp_entry_t *top,
   /* Bump stats in the counts hashtable */
   hp_inc_count(counts, "ct", 1  TSRMLS_CC);
 
-  hp_inc_count(counts, "wt", get_us_from_tsc(tsc_end - top->tsc_start,
-        hp_globals.cpu_frequencies[hp_globals.cur_cpu_id]) TSRMLS_CC);
+  if (hp_globals.cpu_frequencies) {
+    hp_inc_count(counts, "wt", get_us_from_tsc(tsc_end - top->tsc_start,
+          hp_globals.cpu_frequencies[hp_globals.cur_cpu_id]) TSRMLS_CC);
+  } else {
+    hp_inc_count(counts, "wt", (double) 0.0 TSRMLS_CC);
+  }
   return counts;
 }
 
