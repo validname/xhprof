@@ -141,6 +141,8 @@ typedef struct hp_entry_t {
   struct rusage           ru_start_hprof;             /* user/sys time start */
   struct hp_entry_t      *prev_hprof;    /* ptr to prev entry being profiled */
   uint8                   hash_code;     /* hash_code for the function name  */
+  struct timespec         ts_start;      /* Start time of function */
+
 } hp_entry_t;
 
 /* Various types for XHPROF callbacks       */
@@ -508,7 +510,8 @@ PHP_MINIT_FUNCTION(xhprof) {
 PHP_MSHUTDOWN_FUNCTION(xhprof) {
   /* Make sure cpu_frequencies is free'ed. */
   clear_frequencies();
-  restore_cpu_affinity(&hp_globals.prev_mask);
+  if ( hp_globals.profiler_level==XHPROF_MODE_SAMPLED )
+    restore_cpu_affinity(&hp_globals.prev_mask);
 
   /* free any remaining items in the free list */
   hp_free_the_free_list();
@@ -695,9 +698,6 @@ void hp_init_profiler_state(int level TSRMLS_DC) {
   if (hp_globals.cpu_frequencies == NULL) {
     get_all_cpu_frequencies();
   }
-
-  /* bind to a random cpu so that we can use rdtsc instruction. */
-  bind_to_cpu((int) (rand() % hp_globals.cpu_num));
 
   /* Call current mode's init cb */
   hp_globals.mode_cb.init_cb(TSRMLS_C);
@@ -1545,6 +1545,9 @@ void hp_mode_sampled_init_cb(TSRMLS_D) {
      * hp_globals.sampling_interval_tsc will be zero. */
   }
 
+  /* bind to a random cpu so that we can use rdtsc instruction. */
+  bind_to_cpu((int) (rand() % hp_globals.cpu_num));
+
   /* Init the last_sample in tsc */
   hp_globals.last_sample_tsc = cycle_timer();
 
@@ -1580,8 +1583,8 @@ void hp_mode_sampled_init_cb(TSRMLS_D) {
  */
 void hp_mode_hier_beginfn_cb(hp_entry_t **entries,
                              hp_entry_t  *current  TSRMLS_DC) {
-  /* Get start tsc counter */
-  current->tsc_start = cycle_timer();
+  /* Get current MONOTONIC_COARSE time */
+  clock_gettime(6, &(current->ts_start));
 
   /* Get CPU usage */
   if (hp_globals.xhprof_flags & XHPROF_FLAGS_CPU) {
@@ -1621,11 +1624,9 @@ void hp_mode_sampled_beginfn_cb(hp_entry_t **entries,
  */
 zval * hp_mode_shared_endfn_cb(hp_entry_t *top,
                                char          *symbol  TSRMLS_DC) {
-  zval    *counts;
-  uint64   tsc_end;
-
-  /* Get end tsc counter */
-  tsc_end = cycle_timer();
+  zval            *counts;
+  struct timespec ts_end;
+  long            interval;
 
   /* Get the stat array */
   if (!(counts = hp_hash_lookup(symbol TSRMLS_CC))) {
@@ -1635,12 +1636,14 @@ zval * hp_mode_shared_endfn_cb(hp_entry_t *top,
   /* Bump stats in the counts hashtable */
   hp_inc_count(counts, "ct", 1  TSRMLS_CC);
 
-  if (hp_globals.cpu_frequencies) {
-    hp_inc_count(counts, "wt", get_us_from_tsc(tsc_end - top->tsc_start,
-          hp_globals.cpu_frequencies[hp_globals.cur_cpu_id]) TSRMLS_CC);
-  } else {
-    hp_inc_count(counts, "wt", (double) 0.0 TSRMLS_CC);
-  }
+  /* Get current MONOTONIC_COARSE time */
+  clock_gettime(6, &ts_end);
+
+  interval = ((long)ts_end.tv_sec-(long)top->ts_start.tv_sec)*1000000 + 
+             ((long)ts_end.tv_nsec-(long)top->ts_start.tv_nsec)/1000;
+
+  hp_inc_count(counts, "wt", interval TSRMLS_CC);
+
   return counts;
 }
 
@@ -2001,7 +2004,8 @@ static void hp_stop(TSRMLS_D) {
   zend_compile_string   = _zend_compile_string;
 
   /* Resore cpu affinity. */
-  restore_cpu_affinity(&hp_globals.prev_mask);
+  if ( hp_globals.profiler_level==XHPROF_MODE_SAMPLED )
+    restore_cpu_affinity(&hp_globals.prev_mask);
 
   /* Stop profiling */
   hp_globals.enabled = 0;
